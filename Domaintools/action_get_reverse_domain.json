@@ -27,7 +27,7 @@
       "ip_history": {
         "type": "array",
         "items": {
-          "type": "string"
+          "type": "object"
         }
       }
     },
