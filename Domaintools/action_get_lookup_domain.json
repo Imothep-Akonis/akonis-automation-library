@@ -29,7 +29,7 @@
       "results": {
             "type": "array",
             "items": {
-              "type": "object"
+              "type": "string"
             }
           },
       "missing_domains": { "type": "array" }
