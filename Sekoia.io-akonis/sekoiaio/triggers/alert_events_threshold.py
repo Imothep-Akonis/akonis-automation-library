@@ -2,7 +2,7 @@ import asyncio
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from aiohttp import ClientSession, ClientError, ClientTimeout
 from sekoia_automation.aio.connector import AsyncConnector
@@ -150,7 +150,7 @@ class AlertEventsThresholdTrigger(AsyncConnector):
         """Construct Event API base URL."""
         return f"{self._api_url}/v2/events"
 
-    async def _init_session(self):
+    async def _init_session(self) -> None:
         """
         Initialize HTTP session with authentication headers and timeout.
         """
@@ -162,9 +162,11 @@ class AlertEventsThresholdTrigger(AsyncConnector):
             timeout = ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
             self.session = ClientSession(headers=headers, timeout=timeout)
 
-    async def _close_session(self):
+    async def _close_session(self) -> None:
         if getattr(self, "session", None) is not None:
             try:
+                # mypy will accept that session is not None after the getattr check
+                assert self.session is not None
                 await self.session.close()
             finally:
                 self.session = None
@@ -174,6 +176,10 @@ class AlertEventsThresholdTrigger(AsyncConnector):
         """
         Retrieve full alert details from Alert API with retry logic.
         """
+        # ensure session is initialized and not None
+        await self._init_session()
+        assert self.session is not None
+
         url = f"{self.alert_api_url}/{alert_uuid}"
         params = {
             "stix": "false",
@@ -182,7 +188,7 @@ class AlertEventsThresholdTrigger(AsyncConnector):
             "history": "false",
         }
 
-        last_error = None
+        last_error: Optional[BaseException] = None
         for attempt in range(MAX_RETRY_ATTEMPTS):
             try:
                 async with self.session.get(url, params=params) as response:
@@ -224,6 +230,10 @@ class AlertEventsThresholdTrigger(AsyncConnector):
         """
         Count events added to alert within the last N hours.
         """
+        # ensure session is initialized
+        await self._init_session()
+        assert self.session is not None
+
         earliest_time = datetime.now(timezone.utc) - timedelta(hours=hours)
 
         url = f"{self.event_api_url}/search"
@@ -249,7 +259,7 @@ class AlertEventsThresholdTrigger(AsyncConnector):
                     )
                     return 0
 
-                return data.get("total", 0)
+                return int(data.get("total", 0))
 
         except ClientError as e:
             self.log(
@@ -310,7 +320,7 @@ class AlertEventsThresholdTrigger(AsyncConnector):
             THRESHOLD_CHECKS.labels(triggered="false").inc()
             return False, {}
 
-        trigger_reasons = []
+        trigger_reasons: list[str] = []
 
         # Volume-based threshold
         if self.configuration.enable_volume_threshold:
@@ -342,7 +352,7 @@ class AlertEventsThresholdTrigger(AsyncConnector):
 
         return should_trigger, context
 
-    async def _process_alert_update(self, notification: dict[str, Any]):
+    async def _process_alert_update(self, notification: dict[str, Any]) -> None:
         """
         Process a single alert update notification.
         """
@@ -367,6 +377,9 @@ class AlertEventsThresholdTrigger(AsyncConnector):
                 EVENTS_FILTERED.labels(reason="rule_filter").inc()
                 return
 
+            # Ensure we have a state manager
+            assert self.state_manager is not None, "state_manager must be initialized before processing alerts"
+
             # Load previous state
             previous_state = self.state_manager.get_alert_state(alert_uuid)
 
@@ -385,9 +398,12 @@ class AlertEventsThresholdTrigger(AsyncConnector):
                 return
 
             # Update state before triggering (with version tracking)
+            # Ensure we pass a string for alert_short_id (AlertStateManager expects str)
+            alert_short_id = cast(str, alert.get("short_id") or "")
+
             self.state_manager.update_alert_state(
                 alert_uuid=alert_uuid,
-                alert_short_id=alert.get("short_id"),
+                alert_short_id=alert_short_id,
                 rule_uuid=alert.get("rule", {}).get("uuid"),
                 rule_name=alert.get("rule", {}).get("name"),
                 event_count=alert.get("events_count", 0),
@@ -404,7 +420,6 @@ class AlertEventsThresholdTrigger(AsyncConnector):
                 },
             }
 
-            # CRITICAL FIX: Use positional arguments for send_event
             # AsyncConnector.send_event signature: send_event(event_name: str, event: dict)
             await self.send_event("alert_threshold_met", payload)
 
@@ -430,7 +445,7 @@ class AlertEventsThresholdTrigger(AsyncConnector):
                 message=f"Error processing alert update for {alert_uuid}",
             )
 
-    async def _cleanup_old_states(self):
+    async def _cleanup_old_states(self) -> None:
         """
         Periodically clean up state entries for old alerts.
         """
@@ -441,10 +456,17 @@ class AlertEventsThresholdTrigger(AsyncConnector):
             return
 
         cutoff_date = now - timedelta(days=self.configuration.state_cleanup_days)
+
+        assert self.state_manager is not None, "state_manager must be initialized before cleanup"
         removed = self.state_manager.cleanup_old_states(cutoff_date)
 
         # Update state size metric
-        STATE_SIZE.set(len(self.state_manager._state["alerts"]))
+        # Accessing internals of state manager for metric; keep as-is but assert structure
+        try:
+            STATE_SIZE.set(len(self.state_manager._state["alerts"]))
+        except Exception:
+            # If structure differs, set to 0 to avoid crashes
+            STATE_SIZE.set(0)
 
         self.log(
             message=f"State cleanup: removed {removed} entries older than {self.configuration.state_cleanup_days} days",
@@ -453,7 +475,7 @@ class AlertEventsThresholdTrigger(AsyncConnector):
 
         self._last_cleanup = now
 
-    async def next_batch(self):
+    async def next_batch(self) -> None:
         """
         Main loop: listen to notifications and process alert updates.
         """
@@ -478,7 +500,7 @@ class AlertEventsThresholdTrigger(AsyncConnector):
         finally:
             await self._close_session()
 
-    async def run(self):
+    async def run(self) -> None:
         """Entrypoint for the trigger."""
         try:
             while True:

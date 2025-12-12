@@ -1,10 +1,10 @@
 {
   "uuid": "bb064afe-25be-4acf-af96-b997b8fa9112",
   "name": "Alert Events Threshold Trigger",
+  "docker_parameters": "alert_events_threshold_trigger",
   "slug": "alert_events_threshold",
   "description": "Trigger playbooks only when alert event accumulation thresholds are met, preventing excessive executions for incremental updates. Internal module with automatic authentication.",
-  "docker": "sekoiaio",
-  "configuration": {
+  "arguments": {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
     "title": "Alert Events Threshold Trigger Configuration",
