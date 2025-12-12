@@ -476,10 +476,7 @@ class AlertEventsThresholdTrigger(AsyncConnector):
         self._last_cleanup = now
 
     async def next_batch(self) -> None:
-        """
-        Main loop: listen to notifications and process alert updates.
-        """
-        # Initialize session and state manager
+        """Main loop: listen to notifications and process alert updates."""
         await self._init_session()
         state_path = self._data_path / "alert_thresholds_state.json"
         self.state_manager = AlertStateManager(state_path, logger=self.log)
@@ -487,7 +484,6 @@ class AlertEventsThresholdTrigger(AsyncConnector):
         self.log(message="AlertEventsThresholdTrigger started", level="info")
 
         try:
-            # Subscribe to alert updated notifications
             async for notification in self._subscribe_to_notifications("alert", "updated"):
                 try:
                     await self._cleanup_old_states()
@@ -496,22 +492,54 @@ class AlertEventsThresholdTrigger(AsyncConnector):
                     raise
                 except Exception as e:
                     self.log_exception(e, message="Error processing notification")
-
         finally:
             await self._close_session()
 
-    async def run(self) -> None:
-        """Entrypoint for the trigger."""
+
+    def run(self) -> None:  # pragma: no cover
+        """
+        Sync entrypoint normally used by Sekoia.io.
+        If already running inside an event loop (pytest), defer to async version.
+        """
         try:
-            while True:
-                try:
-                    await self.next_batch()
-                except asyncio.CancelledError:
-                    self.log(message="Trigger cancelled", level="info")
-                    break
-                except Exception as e:
-                    self.log_exception(e, message="Fatal error in trigger")
-                    await asyncio.sleep(RESTART_DELAY_SECONDS)
+            loop = asyncio.get_running_loop()
+            # We are already inside an async context → tests
+            return self._run_async_direct()  
+        except RuntimeError:
+            # No running loop → normal Sekoia runtime
+            pass
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        try:
+            loop.run_until_complete(self._async_run())
+        except asyncio.CancelledError:
+            self.log("Trigger cancelled", level="info")
+        except Exception as e:
+            self.log_exception(e, "Fatal error in trigger.run")
         finally:
-            # Ensure session is closed on exit
+            loop.run_until_complete(self._close_session())
+            loop.close()
+
+
+    async def _run_async_direct(self) -> None:
+        """
+        Async wrapper used exclusively in tests.
+        """
+        try:
+            await self._async_run()
+        finally:
             await self._close_session()
+
+
+    async def _async_run(self):
+        while True:
+            try:
+                await self.next_batch()
+            except asyncio.CancelledError:
+                self.log("Trigger cancelled", level="info")
+                break
+            except Exception as e:
+                self.log_exception(e, "Fatal error in trigger loop")
+                await asyncio.sleep(RESTART_DELAY_SECONDS)
