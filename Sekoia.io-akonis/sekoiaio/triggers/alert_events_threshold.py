@@ -11,6 +11,9 @@ from pydantic import BaseModel, Field, model_validator
 from .helpers.state_manager import AlertStateManager
 from .metrics import EVENTS_FORWARDED, EVENTS_FILTERED, THRESHOLD_CHECKS, STATE_SIZE
 
+import json
+from collections.abc import AsyncGenerator
+
 # Constants
 RESTART_DELAY_SECONDS = 60
 RETRY_DELAY_SECONDS = 5
@@ -552,3 +555,133 @@ class AlertEventsThresholdTrigger(AsyncConnector):
             except Exception as e:
                 self.log_exception(e, message="Fatal error in trigger loop")
                 await asyncio.sleep(RESTART_DELAY_SECONDS)
+
+
+    async def listen(
+        self,
+        resource_type: str,
+        event_type: str,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """
+        Listen to Sekoia.io notification stream for specific resource events.
+        
+        This method establishes a persistent connection to the Sekoia.io notifications API
+        and yields notifications as they arrive.
+        
+        Args:
+            resource_type: Type of resource to monitor (e.g., "alert")
+            event_type: Type of event to monitor (e.g., "updated")
+            
+        Yields:
+            dict[str, Any]: Notification payload containing event details
+            
+        Raises:
+            ClientError: If connection to notifications API fails
+        """
+        await self._init_session()
+        assert self.session is not None
+        
+        # Construct notifications API endpoint
+        notifications_url = f"{self._api_url}/v1/notifications/stream"
+        
+        # Filter parameters for the stream
+        params = {
+            "resource_type": resource_type,
+            "event_type": event_type,
+        }
+        
+        self.log(
+            message=f"Starting notification stream for {resource_type}.{event_type}",
+            level="info",
+        )
+        
+        retry_count = 0
+        max_retries = 10
+        
+        while True:
+            try:
+                async with self.session.get(
+                    notifications_url,
+                    params=params,
+                    timeout=None,  # SSE connection should stay open
+                ) as response:
+                    response.raise_for_status()
+                    
+                    # Reset retry counter on successful connection
+                    retry_count = 0
+                    
+                    self.log(
+                        message=f"Connected to notification stream ({resource_type}.{event_type})",
+                        level="info",
+                    )
+                    
+                    # Read Server-Sent Events (SSE) stream
+                    async for line in response.content:
+                        if not line:
+                            continue
+                        
+                        decoded_line = line.decode('utf-8').strip()
+                        
+                        # SSE format: "data: {json_payload}"
+                        if decoded_line.startswith('data: '):
+                            data_str = decoded_line[6:]  # Remove "data: " prefix
+                            
+                            # Skip keep-alive pings
+                            if data_str.strip() in ('', 'ping', '{}'):
+                                continue
+                            
+                            try:
+                                notification = json.loads(data_str)
+                                
+                                # Validate notification structure
+                                if isinstance(notification, dict):
+                                    yield notification
+                                else:
+                                    self.log(
+                                        message=f"Invalid notification format: {type(notification)}",
+                                        level="warning",
+                                    )
+                                    
+                            except json.JSONDecodeError as e:
+                                self.log(
+                                    message=f"Failed to parse notification JSON: {e}",
+                                    level="warning",
+                                )
+                                continue
+            
+            except asyncio.CancelledError:
+                self.log(
+                    message="Notification stream cancelled",
+                    level="info",
+                )
+                raise
+            
+            except ClientError as e:
+                retry_count += 1
+                
+                if retry_count > max_retries:
+                    self.log_exception(
+                        e,
+                        message=f"Failed to maintain notification stream after {max_retries} retries",
+                    )
+                    raise
+                
+                # Exponential backoff with jitter
+                backoff_delay = min(RETRY_DELAY_SECONDS * (2 ** retry_count), 300)
+                
+                self.log(
+                    message=f"Notification stream disconnected (attempt {retry_count}/{max_retries}): {e}. "
+                            f"Reconnecting in {backoff_delay}s...",
+                    level="warning",
+                )
+                
+                await asyncio.sleep(backoff_delay)
+            
+            except Exception as e:
+                self.log_exception(
+                    e,
+                    message="Unexpected error in notification stream",
+                )
+                
+                # Wait before reconnecting
+                await asyncio.sleep(RETRY_DELAY_SECONDS)
