@@ -90,14 +90,14 @@ class AlertEventsThresholdConfiguration(BaseModel):
         description="Remove state entries for alerts older than N days",
     )
 
-    @model_validator(mode='after')
+    @model_validator(mode="after")
     def validate_at_least_one_threshold(self):
         """Ensure at least one threshold is enabled."""
         if not self.enable_volume_threshold and not self.enable_time_threshold:
             raise ValueError("At least one threshold must be enabled")
         return self
 
-    @model_validator(mode='after')
+    @model_validator(mode="after")
     def validate_configuration_consistency(self):
         """Validate configuration parameter relationships."""
         # Both filters set is confusing
@@ -115,7 +115,7 @@ class AlertEventsThresholdTrigger(Trigger):
     """
     Trigger that monitors alert updates via LiveAPI WebSocket and triggers playbooks
     when event accumulation thresholds are met.
-    
+
     This is a Trigger (not a Connector) that:
     - Listens to real-time alert.updated events via WebSocket
     - Detects addition of new events in alerts
@@ -123,7 +123,7 @@ class AlertEventsThresholdTrigger(Trigger):
     - Triggers playbooks via send_event() when thresholds are met
     - Maintains persistent state to avoid duplicate triggers
     """
-    
+
     configuration: AlertEventsThresholdConfiguration
 
     def __init__(self, *args, **kwargs):
@@ -187,12 +187,12 @@ class AlertEventsThresholdTrigger(Trigger):
     async def _connect_websocket(self) -> Any:
         """
         Connect to LiveAPI WebSocket with authentication.
-        
+
         Returns:
             WebSocket connection object
         """
         import aiohttp
-        
+
         await self._init_session()
         assert self.session is not None
 
@@ -203,13 +203,19 @@ class AlertEventsThresholdTrigger(Trigger):
         self.log(message="Connecting to LiveAPI WebSocket...", level="info")
 
         try:
+            # Create WebSocket-specific timeout
+            ws_timeout = aiohttp.ClientWSTimeout(
+                ws_close=WEBSOCKET_PING_TIMEOUT,
+                ws_receive=WEBSOCKET_PING_TIMEOUT,
+            )
+
             ws = await self.session.ws_connect(
                 self.websocket_url,
                 headers=headers,
                 heartbeat=WEBSOCKET_PING_INTERVAL,
-                timeout=WEBSOCKET_PING_TIMEOUT,
+                timeout=ws_timeout,
             )
-            
+
             self.log(message="Connected to LiveAPI WebSocket", level="info")
             return ws
 
@@ -228,13 +234,13 @@ class AlertEventsThresholdTrigger(Trigger):
     async def _retrieve_alert_from_alertapi(self, alert_uuid: str) -> dict[str, Any]:
         """
         Retrieve full alert details from Alert API with retry logic.
-        
+
         Args:
             alert_uuid: UUID of the alert
-            
+
         Returns:
             Alert data dictionary
-            
+
         Raises:
             ClientError: If retrieval fails after retries
             ValueError: If response format is invalid
@@ -251,7 +257,7 @@ class AlertEventsThresholdTrigger(Trigger):
         }
 
         last_error: Optional[BaseException] = None
-        
+
         for attempt in range(MAX_RETRY_ATTEMPTS):
             try:
                 async with self.session.get(url, params=params) as response:
@@ -278,7 +284,7 @@ class AlertEventsThresholdTrigger(Trigger):
                         message=f"Failed to retrieve alert {alert_uuid} after {MAX_RETRY_ATTEMPTS} attempts",
                     )
                     raise
-                    
+
             except ValueError as e:
                 self.log_exception(e, message=f"Invalid alert response for {alert_uuid}")
                 raise
@@ -292,11 +298,11 @@ class AlertEventsThresholdTrigger(Trigger):
     ) -> int:
         """
         Count events added to alert within the last N hours.
-        
+
         Args:
             alert_uuid: UUID of the alert
             hours: Time window in hours
-            
+
         Returns:
             Number of events in time window
         """
@@ -340,10 +346,10 @@ class AlertEventsThresholdTrigger(Trigger):
     def _matches_rule_filter(self, alert: dict[str, Any]) -> bool:
         """
         Check if alert matches configured rule filters.
-        
+
         Args:
             alert: Alert data dictionary
-            
+
         Returns:
             True if alert matches filters, False otherwise
         """
@@ -372,11 +378,11 @@ class AlertEventsThresholdTrigger(Trigger):
     ) -> tuple[bool, dict[str, Any]]:
         """
         Evaluate whether alert meets triggering thresholds.
-        
+
         Args:
             alert: Alert data dictionary
             previous_state: Previous state for this alert (if any)
-            
+
         Returns:
             Tuple of (should_trigger, context_dict)
         """
@@ -437,7 +443,7 @@ class AlertEventsThresholdTrigger(Trigger):
     async def _process_alert_update(self, notification: dict[str, Any]) -> None:
         """
         Process a single alert.updated notification.
-        
+
         Args:
             notification: WebSocket notification payload
         """
@@ -451,7 +457,7 @@ class AlertEventsThresholdTrigger(Trigger):
         # Extract alert info from notification
         alert_data = notification.get("alert", {})
         alert_uuid = alert_data.get("uuid")
-        
+
         if not alert_uuid:
             self.log(message="Notification missing alert UUID", level="warning")
             return
@@ -487,7 +493,7 @@ class AlertEventsThresholdTrigger(Trigger):
 
             # Update state before triggering
             alert_short_id = cast(str, alert.get("short_id") or "")
-            
+
             self.state_manager.update_alert_state(
                 alert_uuid=alert_uuid,
                 alert_short_id=alert_short_id,
@@ -519,7 +525,7 @@ class AlertEventsThresholdTrigger(Trigger):
 
             self.log(
                 message=f"Triggered playbook for alert {alert.get('short_id')}: "
-                        f"{context['new_events']} new events ({context['reason']})",
+                f"{context['new_events']} new events ({context['reason']})",
                 level="info",
             )
 
@@ -555,7 +561,7 @@ class AlertEventsThresholdTrigger(Trigger):
 
         self.log(
             message=f"State cleanup: removed {removed} entries older than "
-                    f"{self.configuration.state_cleanup_days} days",
+            f"{self.configuration.state_cleanup_days} days",
             level="info",
         )
 
@@ -564,12 +570,12 @@ class AlertEventsThresholdTrigger(Trigger):
     async def _listen_websocket(self) -> None:
         """
         Main WebSocket listener loop.
-        
+
         Connects to LiveAPI WebSocket, filters for alert.updated events,
         and processes them via _process_alert_update().
         """
         import aiohttp
-        
+
         retry_count = 0
         max_retries = 10
 
@@ -584,25 +590,25 @@ class AlertEventsThresholdTrigger(Trigger):
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         try:
                             data = msg.json()
-                            
+
                             # Filter for alert.updated events
                             if data.get("event") == "alert.updated":
                                 await self._cleanup_old_states()
                                 await self._process_alert_update(data)
-                                
+
                         except Exception as e:
                             self.log_exception(
                                 e,
                                 message="Error processing WebSocket message",
                             )
-                            
+
                     elif msg.type == aiohttp.WSMsgType.ERROR:
                         self.log(
                             message=f"WebSocket error: {self._websocket.exception()}",
                             level="error",
                         )
                         break
-                        
+
                     elif msg.type == aiohttp.WSMsgType.CLOSED:
                         self.log(message="WebSocket closed", level="warning")
                         break
@@ -610,34 +616,34 @@ class AlertEventsThresholdTrigger(Trigger):
             except asyncio.CancelledError:
                 self.log(message="WebSocket listener cancelled", level="info")
                 break
-                
+
             except Exception as e:
                 retry_count += 1
-                
+
                 if retry_count > max_retries:
                     self.log_exception(
                         e,
                         message=f"Failed to maintain WebSocket after {max_retries} retries",
                     )
                     raise
-                
-                backoff_delay = min(RETRY_DELAY_SECONDS * (2 ** retry_count), 300)
-                
+
+                backoff_delay = min(RETRY_DELAY_SECONDS * (2**retry_count), 300)
+
                 self.log(
                     message=f"WebSocket disconnected (attempt {retry_count}/{max_retries}): {e}. "
-                            f"Reconnecting in {backoff_delay}s...",
+                    f"Reconnecting in {backoff_delay}s...",
                     level="warning",
                 )
-                
+
                 await asyncio.sleep(backoff_delay)
-                
+
             finally:
                 await self._close_websocket()
 
     def run(self) -> None:
         """
         Main entry point for the trigger (called by Sekoia.io runtime).
-        
+
         Initializes state manager, connects to WebSocket, and processes events.
         """
         # Initialize state manager
@@ -659,5 +665,5 @@ class AlertEventsThresholdTrigger(Trigger):
                 asyncio.run(self._close_session())
             except Exception:
                 pass
-            
+
             self.log(message="AlertEventsThresholdTrigger stopped", level="info")

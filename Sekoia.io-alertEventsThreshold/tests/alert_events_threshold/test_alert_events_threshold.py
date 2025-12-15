@@ -17,13 +17,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 from typing import Any
-from sekoiaio.triggers.helpers.state_manager import AlertStateManager
 
 import pytest
-from aiohttp import WSMsgType
+from aiohttp import WSMsgType, ClientError
+from pydantic import ValidationError
 
 from sekoia_automation.module import Module
-from alert_events_threshold import (
+from sekoiaio.triggers.alert_events_threshold import (
     AlertEventsThresholdConfiguration,
     AlertEventsThresholdTrigger,
 )
@@ -110,7 +110,7 @@ class TestConfiguration:
         valid_config["enable_volume_threshold"] = False
         valid_config["enable_time_threshold"] = False
         
-        with pytest.raises(ValueError, match="at least one threshold"):
+        with pytest.raises(ValidationError, match="At least one threshold"):
             AlertEventsThresholdConfiguration(**valid_config)
 
     def test_conflicting_rule_filters(self, valid_config):
@@ -118,7 +118,7 @@ class TestConfiguration:
         valid_config["rule_filter"] = "test_rule"
         valid_config["rule_names_filter"] = ["rule1", "rule2"]
         
-        with pytest.raises(ValueError, match="either rule_filter OR rule_names_filter"):
+        with pytest.raises(ValidationError, match="either rule_filter OR rule_names_filter"):
             AlertEventsThresholdConfiguration(**valid_config)
 
     def test_cleanup_days_validation(self, valid_config):
@@ -126,24 +126,24 @@ class TestConfiguration:
         valid_config["time_window_hours"] = 168  # 7 days
         valid_config["state_cleanup_days"] = 6  # Less than 7 days
         
-        with pytest.raises(ValueError, match="state_cleanup_days must be longer"):
+        with pytest.raises(ValidationError, match="state_cleanup_days must be longer"):
             AlertEventsThresholdConfiguration(**valid_config)
 
     def test_threshold_bounds(self, valid_config):
         """Test threshold parameter bounds."""
         # Test minimum event count
         valid_config["event_count_threshold"] = 0
-        with pytest.raises(ValueError):
+        with pytest.raises(ValidationError):
             AlertEventsThresholdConfiguration(**valid_config)
         
         # Test time window bounds
         valid_config["event_count_threshold"] = 100
         valid_config["time_window_hours"] = 0
-        with pytest.raises(ValueError):
+        with pytest.raises(ValidationError):
             AlertEventsThresholdConfiguration(**valid_config)
         
         valid_config["time_window_hours"] = 200  # > 168 (7 days)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValidationError):
             AlertEventsThresholdConfiguration(**valid_config)
 
 
@@ -380,7 +380,7 @@ class TestAlertProcessing:
     @pytest.mark.asyncio
     async def test_filtered_by_rule(self, trigger, temp_data_dir):
         """Test alert filtered by rule filter."""
-
+        from sekoiaio.triggers.helpers.state_manager import AlertStateManager
         
         trigger.configuration.rule_filter = "Specific Rule"
         trigger.state_manager = AlertStateManager(
@@ -408,7 +408,7 @@ class TestAlertProcessing:
     @pytest.mark.asyncio
     async def test_successful_trigger(self, trigger, temp_data_dir):
         """Test successful alert processing and playbook trigger."""
-
+        from sekoiaio.triggers.helpers.state_manager import AlertStateManager
         
         trigger.state_manager = AlertStateManager(
             temp_data_dir / "state.json",
@@ -451,15 +451,15 @@ class TestEventCounting:
     @pytest.mark.asyncio
     async def test_count_events_success(self, trigger):
         """Test successful event counting."""
-        # Mock HTTP session
+        # Mock HTTP session with proper context manager
         mock_response = AsyncMock()
         mock_response.raise_for_status = Mock()
         mock_response.json = AsyncMock(return_value={"total": 42})
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=None)
         
         trigger.session = AsyncMock()
-        trigger.session.post = AsyncMock(return_value=mock_response)
-        trigger.session.__aenter__ = AsyncMock(return_value=trigger.session)
-        trigger.session.__aexit__ = AsyncMock()
+        trigger.session.post = Mock(return_value=mock_response)
         
         count = await trigger._count_events_in_time_window("alert-123", 1)
         
@@ -468,14 +468,19 @@ class TestEventCounting:
     @pytest.mark.asyncio
     async def test_count_events_error_returns_zero(self, trigger):
         """Test that event counting errors return 0."""
-        # Mock HTTP session with error
+        # Mock HTTP session that raises error when entering context
+        mock_response = AsyncMock()
+        mock_response.__aenter__ = AsyncMock(side_effect=ClientError("API error"))
+        mock_response.__aexit__ = AsyncMock(return_value=None)
+        
         trigger.session = AsyncMock()
-        trigger.session.post = AsyncMock(side_effect=Exception("API error"))
+        trigger.session.post = Mock(return_value=mock_response)
         
         count = await trigger._count_events_in_time_window("alert-123", 1)
         
         assert count == 0
-        trigger.log.assert_called()
+        # Verify error was logged
+        assert any("Failed to count events" in str(call) for call in trigger.log.call_args_list)
 
 
 class TestStateCleanup:
@@ -484,7 +489,7 @@ class TestStateCleanup:
     @pytest.mark.asyncio
     async def test_cleanup_skipped_if_recent(self, trigger, temp_data_dir):
         """Test that cleanup is skipped if run recently."""
-
+        from sekoiaio.triggers.helpers.state_manager import AlertStateManager
         
         trigger.state_manager = AlertStateManager(
             temp_data_dir / "state.json",
@@ -506,7 +511,7 @@ class TestStateCleanup:
     @pytest.mark.asyncio
     async def test_cleanup_removes_old_entries(self, trigger, temp_data_dir):
         """Test that old entries are removed during cleanup."""
-
+        from sekoiaio.triggers.helpers.state_manager import AlertStateManager
         
         trigger.state_manager = AlertStateManager(
             temp_data_dir / "state.json",
@@ -552,7 +557,7 @@ class TestWebSocketIntegration:
     @pytest.mark.asyncio
     async def test_websocket_message_processing(self, trigger, temp_data_dir):
         """Test processing of WebSocket messages."""
-
+        from sekoiaio.triggers.helpers.state_manager import AlertStateManager
         
         trigger.state_manager = AlertStateManager(
             temp_data_dir / "state.json",

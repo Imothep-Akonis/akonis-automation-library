@@ -15,6 +15,7 @@ import fcntl
 import json
 import multiprocessing
 import time
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock
@@ -22,6 +23,7 @@ from unittest.mock import Mock
 import pytest
 
 from sekoiaio.triggers.helpers.state_manager import AlertStateManager
+
 
 @pytest.fixture
 def temp_state_file(tmp_path):
@@ -442,36 +444,46 @@ class TestConcurrentAccess:
             event_count=100,
         )
         
-        def read_state():
-            manager = AlertStateManager(temp_state_file)
-            return manager.get_alert_state("alert-123")
+        results = []
+        errors = []
         
-        # Multiple concurrent reads should work
-        with multiprocessing.Pool(processes=3) as pool:
-            results = pool.map(lambda _: read_state(), range(3))
+        def read_state():
+            """Helper function for threading."""
+            try:
+                manager = AlertStateManager(temp_state_file)
+                result = manager.get_alert_state("alert-123")
+                results.append(result)
+            except Exception as e:
+                errors.append(e)
+        
+        # Multiple concurrent reads should work (using threads instead of processes)
+        threads = [threading.Thread(target=read_state) for _ in range(3)]
+        
+        for thread in threads:
+            thread.start()
+        
+        for thread in threads:
+            thread.join()
         
         # All reads should succeed
+        assert len(errors) == 0, f"Errors occurred: {errors}"
+        assert len(results) == 3
         assert all(r is not None for r in results)
         assert all(r["alert_uuid"] == "alert-123" for r in results)
 
     def test_sequential_writes(self, temp_state_file):
         """Test that sequential writes maintain consistency."""
-        def update_state(alert_num):
+        # Sequential updates
+        for i in range(5):
             manager = AlertStateManager(temp_state_file)
             manager.update_alert_state(
-                alert_uuid=f"alert-{alert_num}",
-                alert_short_id=f"AL-{alert_num}",
+                alert_uuid=f"alert-{i}",
+                alert_short_id=f"AL-{i}",
                 rule_uuid="rule-456",
                 rule_name="Test Rule",
-                event_count=100 + alert_num,
+                event_count=100 + i,
             )
-            return manager.get_stats()["total_alerts"]
-        
-        # Sequential updates
-        results = []
-        for i in range(5):
-            results.append(update_state(i))
-            time.sleep(0.1)  # Small delay between updates
+            time.sleep(0.05)  # Small delay between updates
         
         # Final state should have all alerts
         manager = AlertStateManager(temp_state_file)
