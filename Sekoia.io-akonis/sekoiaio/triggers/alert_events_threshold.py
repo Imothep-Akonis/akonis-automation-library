@@ -517,7 +517,7 @@ class AlertEventsThresholdTrigger(AsyncConnector):
         except asyncio.CancelledError:
             self.log("Trigger cancelled", level="info")
         except Exception as e:
-            self.log_exception(e, "Fatal error in trigger.run")
+            self.log_exception(e, message="Fatal error in trigger.run")
         finally:
             loop.run_until_complete(self._close_session())
             loop.close()
@@ -541,5 +541,5 @@ class AlertEventsThresholdTrigger(AsyncConnector):
                 self.log("Trigger cancelled", level="info")
                 break
             except Exception as e:
-                self.log_exception(e, "Fatal error in trigger loop")
+                self.log_exception(e, message="Fatal error in trigger loop")
                 await asyncio.sleep(RESTART_DELAY_SECONDS)
