@@ -1,5 +1,5 @@
 {
-  "uuid": "bb064afe-25be-4acf-af96-b997b8fa9112",
+  "uuid": "1ce0a2bd-42d8-4304-9676-1d0f0992be5a",
   "name": "Alert Events Threshold Trigger",
   "docker_parameters": "alert_events_threshold_trigger",
   "slug": "alert_events_threshold",
