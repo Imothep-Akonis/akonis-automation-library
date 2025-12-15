@@ -476,22 +476,31 @@ class AlertEventsThresholdTrigger(AsyncConnector):
         self._last_cleanup = now
 
     async def next_batch(self) -> None:
-        """Main loop: listen to notifications and process alert updates."""
+        """
+        Main loop: listen to notifications and process alert updates.
+        """
         await self._init_session()
+
         state_path = self._data_path / "alert_thresholds_state.json"
         self.state_manager = AlertStateManager(state_path, logger=self.log)
 
         self.log(message="AlertEventsThresholdTrigger started", level="info")
 
         try:
-            async for notification in self._subscribe_to_notifications("alert", "updated"):
+            async for notification in self.listen("alert", "updated"):
                 try:
                     await self._cleanup_old_states()
                     await self._process_alert_update(notification)
+
                 except asyncio.CancelledError:
                     raise
+
                 except Exception as e:
-                    self.log_exception(e, message="Error processing notification")
+                    self.log_exception(
+                        e,
+                        message="Error processing notification",
+                    )
+
         finally:
             await self._close_session()
 
