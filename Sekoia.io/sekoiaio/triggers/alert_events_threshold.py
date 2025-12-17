@@ -1,44 +1,23 @@
-import asyncio
-import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from posixpath import join as urljoin
 from typing import Any, Optional
 
-from aiohttp import ClientSession, ClientError, ClientTimeout
-from sekoia_automation.aio.connector import AsyncConnector
+import orjson
+import requests
 from pydantic import BaseModel, Field, model_validator
 
+from sekoiaio.utils import user_agent
+from .alerts import SecurityAlertsTrigger
 from .helpers.state_manager import AlertStateManager
 from .metrics import EVENTS_FORWARDED, EVENTS_FILTERED, THRESHOLD_CHECKS, STATE_SIZE
-
-# Constants
-RESTART_DELAY_SECONDS = 60
-RETRY_DELAY_SECONDS = 5
-MAX_RETRY_ATTEMPTS = 3
-REQUEST_TIMEOUT_SECONDS = 30
-
-# Allow test runtime to override the symphony directory (so tests point at a tmp dir)
-SYMPHONY_DIR = Path(os.environ.get("SEKOIAIO_MODULE_DIR", "/symphony"))
 
 
 class AlertEventsThresholdConfiguration(BaseModel):
     """
     Configuration for the Alert Events Threshold Trigger.
     """
-
-    # Internal parameters (injected by backend, not exposed to users)
-    base_url: str = Field(
-        default="",
-        description="[INTERNAL] Sekoia.io API base URL (automatically provided)",
-        exclude=True,
-    )
-
-    api_key: str = Field(
-        default="",
-        description="[INTERNAL] API key for reading alert data (automatically provided)",
-        json_schema_extra={"secret": True},
-        exclude=True,
-    )
 
     # User-configurable parameters
     rule_filter: Optional[str] = Field(
@@ -109,182 +88,212 @@ class AlertEventsThresholdConfiguration(BaseModel):
         return self
 
 
-class AlertEventsThresholdTrigger(AsyncConnector):
+class AlertEventsThresholdTrigger(SecurityAlertsTrigger):
     """
     Trigger that monitors alert updates and triggers playbooks only when
     event accumulation thresholds are met.
+
+    Supports dual threshold logic:
+    - Volume-based: Trigger if >= N new events added
+    - Time-based: Trigger if >= 1 event added in last N hours
+
+    This trigger extends SecurityAlertsTrigger to reuse common alert handling logic
+    like API retrieval and rule filtering.
     """
-    configuration: AlertEventsThresholdConfiguration
+
+    # Handle only alert updates
+    HANDLED_EVENT_SUB_TYPES = [("alert", "updated")]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.state_manager: Optional[AlertStateManager] = None
-        self.session: Optional[ClientSession] = None
         self._last_cleanup: Optional[datetime] = None
+        self._initialized = False
 
-        # Data path: prefer environment override (tests will monkeypatch this)
-        self._data_path = Path(os.environ.get("SEKOIAIO_MODULE_DIR", SYMPHONY_DIR)) / "data"
+    def _ensure_initialized(self):
+        """Lazy initialization of state manager."""
+        if not self._initialized:
+            state_path = self._data_path / "alert_thresholds_state.json"
+            self.state_manager = AlertStateManager(state_path, logger=self.log)
+            self._initialized = True
+            self.log(message="AlertEventsThresholdTrigger initialized", level="info")
 
-        # Load internal credentials from module context (injected by backend)
-        # If the module/runtime isn't available during tests, fall back to env vars
-        try:
-            cfg = getattr(self.module, "configuration", None)
-            if cfg is not None:
-                self._api_url = getattr(cfg, "base_url", os.environ.get("SEKOIAIO_API_URL", ""))
-                self._api_key = getattr(cfg, "api_key", os.environ.get("SEKOIAIO_API_KEY", ""))
-            else:
-                self._api_url = os.environ.get("SEKOIAIO_API_URL", "")
-                self._api_key = os.environ.get("SEKOIAIO_API_KEY", "")
-        except Exception:
-            # Defensive fallback so tests don't blow up if AsyncConnector/module isn't fully initialized
-            self._api_url = os.environ.get("SEKOIAIO_API_URL", "")
-            self._api_key = os.environ.get("SEKOIAIO_API_KEY", "")
-
-    @property
-    def alert_api_url(self) -> str:
-        """Construct Alert API base URL."""
-        return f"{self._api_url}/v1/sic/alerts"
-
-    @property
-    def event_api_url(self) -> str:
-        """Construct Event API base URL."""
-        return f"{self._api_url}/v2/events"
-
-    async def _init_session(self):
+    def handle_event(self, message):
         """
-        Initialize HTTP session with authentication headers and timeout.
+        Handle alert update messages with threshold evaluation.
+
+        This method overrides the parent class to add threshold logic before
+        triggering the playbook.
         """
-        if self.session is None:
-            headers = {
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            }
-            timeout = ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
-            self.session = ClientSession(headers=headers, timeout=timeout)
+        # Ensure state manager is initialized
+        self._ensure_initialized()
 
-    async def _close_session(self):
-        """Close HTTP session gracefully."""
-        if self.session:
-            await self.session.close()
-            self.session = None
+        alert_attrs = message.get("attributes", {})
+        event_type: str = message.get("type", "")
+        event_action: str = message.get("action", "")
 
-    async def _retrieve_alert_from_alertapi(self, alert_uuid: str) -> dict[str, Any]:
-        """
-        Retrieve full alert details from Alert API with retry logic.
-        """
-        url = f"{self.alert_api_url}/{alert_uuid}"
-        params = {
-            "stix": "false",
-            "comments": "false",
-            "countermeasures": "false",
-            "history": "false",
-        }
+        # Only handle alert updates
+        if (event_type, event_action) not in self.HANDLED_EVENT_SUB_TYPES:
+            return
 
-        last_error = None
-        for attempt in range(MAX_RETRY_ATTEMPTS):
-            try:
-                async with self.session.get(url, params=params) as response:
-                    response.raise_for_status()
-                    data = await response.json()
-
-                    # Validate response structure
-                    if not isinstance(data, dict) or "uuid" not in data:
-                        raise ValueError(f"Invalid alert response format: {data}")
-
-                    return data
-
-            except ClientError as e:
-                last_error = e
-                if attempt < MAX_RETRY_ATTEMPTS - 1:
-                    self.log(
-                        message=f"Failed to retrieve alert {alert_uuid} (attempt {attempt + 1}/{MAX_RETRY_ATTEMPTS}): {e}",
-                        level="warning",
-                    )
-                    await asyncio.sleep(RETRY_DELAY_SECONDS * (attempt + 1))  # Exponential backoff
-                else:
-                    self.log_exception(
-                        e,
-                        message=f"Failed to retrieve alert {alert_uuid} from Alert API after {MAX_RETRY_ATTEMPTS} attempts",
-                    )
-                    raise
-            except ValueError as e:
-                # Don't retry on validation errors
-                self.log_exception(e, message=f"Invalid alert response for {alert_uuid}")
-                raise
-
-        raise last_error if last_error else RuntimeError("Unexpected error in alert retrieval")
-
-    async def _count_events_in_time_window(
-        self,
-        alert_uuid: str,
-        hours: int,
-    ) -> int:
-        """
-        Count events added to alert within the last N hours.
-        """
-        earliest_time = datetime.now(timezone.utc) - timedelta(hours=hours)
-
-        url = f"{self.event_api_url}/search"
-        payload = {
-            "filter": {
-                "alert_uuid": alert_uuid,
-                "created_at": {
-                    "gte": earliest_time.isoformat(),
-                },
-            },
-            "size": 0,  # We only need the count
-        }
+        # Extract alert UUID
+        alert_uuid: str = alert_attrs.get("uuid", "")
+        if not alert_uuid:
+            self.log(message="Notification missing alert UUID", level="warning")
+            return
 
         try:
-            async with self.session.post(url, json=payload) as response:
-                response.raise_for_status()
-                data = await response.json()
+            # ✨ Reuse parent's method for API retrieval
+            alert = self._retrieve_alert_from_alertapi(alert_uuid)
+        except Exception as exp:
+            self.log_exception(exp, message="Failed to fetch alert from Alert API")
+            return
 
-                if not isinstance(data, dict):
-                    self.log(
-                        message=f"Invalid event search response format for alert {alert_uuid}: {data}",
-                        level="warning",
-                    )
-                    return 0
+        # ✨ Reuse parent's rule filtering logic
+        if not self._should_process_alert(alert):
+            EVENTS_FILTERED.labels(reason="rule_filter").inc()
+            return
 
-                return data.get("total", 0)
+        # Load previous state for this alert
+        previous_state = self.state_manager.get_alert_state(alert_uuid)
 
-        except ClientError as e:
+        # Evaluate thresholds
+        should_trigger, context = self._evaluate_thresholds(alert, previous_state)
+
+        if not should_trigger:
+            EVENTS_FILTERED.labels(reason="threshold_not_met").inc()
             self.log(
-                message=f"Failed to count events for alert {alert_uuid}: {e}",
-                level="warning",
+                message=f"Alert {alert.get('short_id')} does not meet thresholds: {context.get('reason', 'unknown')}",
+                level="debug",
             )
-            return 0  # Fail open: don't block on count errors
+            return
 
-    def _matches_rule_filter(self, alert: dict[str, Any]) -> bool:
+        # Update state before triggering
+        self.state_manager.update_alert_state(
+            alert_uuid=alert_uuid,
+            alert_short_id=alert.get("short_id"),
+            rule_uuid=alert.get("rule", {}).get("uuid"),
+            rule_name=alert.get("rule", {}).get("name"),
+            event_count=alert.get("events_count", 0),
+            previous_version=previous_state.get("version") if previous_state else None,
+        )
+
+        # Periodic cleanup of old states
+        self._cleanup_old_states()
+
+        # ✨ Reuse parent's method for creating event payload
+        self._send_threshold_event(alert, event_type, context)
+
+        EVENTS_FORWARDED.labels(reason=context["reason"]).inc()
+
+        self.log(
+            message=f"Triggered for alert {alert.get('short_id')}: {context['new_events']} new events ({context['reason']})",
+            level="info",
+        )
+
+    def _should_process_alert(self, alert: dict[str, Any]) -> bool:
         """
-        Check if alert matches configured rule filters.
+        Check if alert should be processed based on rule filters.
+
+        This reuses the parent class logic for consistency.
+
+        Args:
+            alert: Alert data dictionary
+
+        Returns:
+            True if alert matches filters (or no filters configured)
         """
+        rule_filter = self.configuration.get("rule_filter")
+        rule_names_filter = self.configuration.get("rule_names_filter")
+
+        # No filters: accept all
+        if not rule_filter and not rule_names_filter:
+            return True
+
         rule_name = alert.get("rule", {}).get("name")
         rule_uuid = alert.get("rule", {}).get("uuid")
 
-        # Single rule filter (name or UUID)
-        if self.configuration.rule_filter:
-            if rule_name == self.configuration.rule_filter:
-                return True
-            if rule_uuid == self.configuration.rule_filter:
-                return True
-            return False
+        # Single rule filter
+        if rule_filter:
+            return rule_name == rule_filter or rule_uuid == rule_filter
 
         # Multiple rule names filter
-        if self.configuration.rule_names_filter:
-            return rule_name in self.configuration.rule_names_filter
+        if rule_names_filter:
+            return rule_name in rule_names_filter
 
-        # No filters configured: accept all
         return True
 
-    async def _evaluate_thresholds(
+    def _send_threshold_event(self, alert: dict[str, Any], event_type: str, context: dict[str, Any]):
+        """
+        Send event to playbook with threshold context.
+
+        This extends the parent's event creation with threshold-specific information.
+
+        Args:
+            alert: Alert data dictionary
+            event_type: Type of the event
+            context: Threshold evaluation context
+        """
+        # Create work directory for alert data
+        work_dir = self._data_path.joinpath("sekoiaio_alert_threshold").joinpath(str(uuid.uuid4()))
+        alert_path = work_dir.joinpath("alert.json")
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        with alert_path.open("w") as fp:
+            fp.write(orjson.dumps(alert).decode("utf-8"))
+
+        directory = str(work_dir.relative_to(self._data_path))
+        file_path = str(alert_path.relative_to(work_dir))
+
+        alert_short_id = alert.get("short_id")
+
+        # Build event payload (similar to parent but with threshold context)
+        event = {
+            "file_path": file_path,
+            "event_type": event_type,
+            "alert_uuid": alert["uuid"],
+            "short_id": alert_short_id,
+            "status": {
+                "name": alert.get("status", {}).get("name"),
+                "uuid": alert.get("status", {}).get("uuid"),
+            },
+            "created_at": alert.get("created_at"),
+            "urgency": alert.get("urgency", {}).get("current_value"),
+            "entity": alert.get("entity", {}),
+            "alert_type": alert.get("alert_type", {}),
+            "rule": {"name": alert["rule"]["name"], "uuid": alert["rule"]["uuid"]},
+            "last_seen_at": alert.get("last_seen_at"),
+            "first_seen_at": alert.get("first_seen_at"),
+            "events_count": alert.get("events_count", 0),
+            # ✨ Add threshold-specific context
+            "trigger_context": {
+                "triggered_at": datetime.now(timezone.utc).isoformat(),
+                "trigger_type": "alert_events_threshold",
+                **context,
+            },
+        }
+
+        self.send_event(
+            event_name=f"Sekoia.io Alert Threshold: {alert_short_id}",
+            event=event,
+            directory=directory,
+            remove_directory=True,
+        )
+
+    def _evaluate_thresholds(
         self,
         alert: dict[str, Any],
         previous_state: Optional[dict[str, Any]],
     ) -> tuple[bool, dict[str, Any]]:
         """
         Evaluate whether alert meets triggering thresholds.
+
+        Args:
+            alert: Current alert data
+            previous_state: Previous state for this alert (if any)
+
+        Returns:
+            Tuple of (should_trigger, trigger_context)
         """
         alert_uuid = alert["uuid"]
         current_event_count = alert.get("events_count", 0)
@@ -306,20 +315,25 @@ class AlertEventsThresholdTrigger(AsyncConnector):
         # No new events: skip
         if new_events <= 0:
             THRESHOLD_CHECKS.labels(triggered="false").inc()
-            return False, {}
+            return False, {"reason": "no_new_events"}
 
         trigger_reasons = []
 
         # Volume-based threshold
-        if self.configuration.enable_volume_threshold:
-            if new_events >= self.configuration.event_count_threshold:
-                trigger_reasons.append("volume_threshold")
+        enable_volume = self.configuration.get("enable_volume_threshold", True)
+        event_count_threshold = self.configuration.get("event_count_threshold", 100)
+
+        if enable_volume and new_events >= event_count_threshold:
+            trigger_reasons.append("volume_threshold")
 
         # Time-based threshold
-        if self.configuration.enable_time_threshold:
-            events_in_window = await self._count_events_in_time_window(
+        enable_time = self.configuration.get("enable_time_threshold", True)
+        time_window_hours = self.configuration.get("time_window_hours", 1)
+
+        if enable_time:
+            events_in_window = self._count_events_in_time_window(
                 alert_uuid,
-                self.configuration.time_window_hours,
+                time_window_hours,
             )
             if events_in_window > 0:
                 trigger_reasons.append("time_threshold")
@@ -331,106 +345,65 @@ class AlertEventsThresholdTrigger(AsyncConnector):
             "new_events": new_events,
             "previous_count": previous_count,
             "current_count": current_event_count,
-            "time_window_hours": self.configuration.time_window_hours,
+            "time_window_hours": time_window_hours,
         }
 
-        THRESHOLD_CHECKS.labels(
-            triggered="true" if should_trigger else "false",
-        ).inc()
+        THRESHOLD_CHECKS.labels(triggered="true" if should_trigger else "false").inc()
 
         return should_trigger, context
 
-    async def _process_alert_update(self, notification: dict[str, Any]):
+    def _count_events_in_time_window(
+        self,
+        alert_uuid: str,
+        hours: int,
+    ) -> int:
         """
-        Process a single alert update notification.
-        """
-        if not isinstance(notification, dict):
-            self.log(
-                message=f"Invalid notification format (expected dict): {type(notification)}",
-                level="warning",
-            )
-            return
+        Count events added to alert within the last N hours.
 
-        alert_uuid = notification.get("alert_uuid")
-        if not alert_uuid:
-            self.log(message="Notification missing alert_uuid", level="warning")
-            return
+        Args:
+            alert_uuid: UUID of the alert
+            hours: Time window in hours
+
+        Returns:
+            Number of events in the time window
+        """
+        earliest_time = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+        api_url = urljoin(self.module.configuration["base_url"], "api/v2/events/search")
+        api_url = api_url.replace("/api/api", "/api")
+
+        api_key = self.module.configuration["api_key"]
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": user_agent(),
+        }
+
+        payload = {
+            "filter": {
+                "alert_uuid": alert_uuid,
+                "created_at": {
+                    "gte": earliest_time.isoformat(),
+                },
+            },
+            "size": 0,  # We only need the count
+        }
 
         try:
-            # Retrieve full alert details
-            alert = await self._retrieve_alert_from_alertapi(alert_uuid)
-
-            # Apply rule filters
-            if not self._matches_rule_filter(alert):
-                EVENTS_FILTERED.labels(reason="rule_filter").inc()
-                return
-
-            # Load previous state
-            previous_state = self.state_manager.get_alert_state(alert_uuid)
-
-            # Evaluate thresholds
-            should_trigger, context = await self._evaluate_thresholds(
-                alert,
-                previous_state,
-            )
-
-            if not should_trigger:
-                EVENTS_FILTERED.labels(reason="threshold_not_met").inc()
-                self.log(
-                    message=f"Alert {alert.get('short_id')} does not meet thresholds: {context.get('reason', 'unknown')}",
-                    level="debug",
-                )
-                return
-
-            # Update state before triggering (with version tracking)
-            self.state_manager.update_alert_state(
-                alert_uuid=alert_uuid,
-                alert_short_id=alert.get("short_id"),
-                rule_uuid=alert.get("rule", {}).get("uuid"),
-                rule_name=alert.get("rule", {}).get("name"),
-                event_count=alert.get("events_count", 0),
-                previous_version=previous_state.get("version") if previous_state else None,
-            )
-
-            # Construct trigger payload
-            payload = {
-                "alert": alert,
-                "trigger_context": {
-                    "triggered_at": datetime.now(timezone.utc).isoformat(),
-                    "trigger_type": "alert_events_threshold",
-                    **context,
-                },
-            }
-
-            # CRITICAL FIX: Use positional arguments for send_event
-            # AsyncConnector.send_event signature: send_event(event_name: str, event: dict)
-            await self.send_event("alert_threshold_met", payload)
-
-            EVENTS_FORWARDED.labels(
-                reason=context["reason"],
-            ).inc()
-
-            self.log(
-                message=f"Triggered for alert {alert.get('short_id')}: {context['new_events']} new events ({context['reason']})",
-                level="info",
-            )
-
-        except ValueError as e:
-            # Validation errors (don't retry)
-            self.log_exception(
-                e,
-                message=f"Validation error processing alert update for {alert_uuid}",
-            )
+            response = requests.post(api_url, headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("total", 0)
         except Exception as e:
-            # Unexpected errors
-            self.log_exception(
-                e,
-                message=f"Error processing alert update for {alert_uuid}",
+            self.log(
+                message=f"Failed to count events for alert {alert_uuid}: {e}",
+                level="warning",
             )
+            return 0  # Fail open: don't block on count errors
 
-    async def _cleanup_old_states(self):
+    def _cleanup_old_states(self):
         """
-        Periodically clean up state entries for old alerts.
+        Periodically clean up state entries for old alerts (once per day).
         """
         now = datetime.now(timezone.utc)
 
@@ -438,56 +411,17 @@ class AlertEventsThresholdTrigger(AsyncConnector):
         if self._last_cleanup and (now - self._last_cleanup).total_seconds() < 86400:
             return
 
-        cutoff_date = now - timedelta(days=self.configuration.state_cleanup_days)
+        state_cleanup_days = self.configuration.get("state_cleanup_days", 30)
+        cutoff_date = now - timedelta(days=state_cleanup_days)
         removed = self.state_manager.cleanup_old_states(cutoff_date)
 
         # Update state size metric
         STATE_SIZE.set(len(self.state_manager._state["alerts"]))
 
-        self.log(
-            message=f"State cleanup: removed {removed} entries older than {self.configuration.state_cleanup_days} days",
-            level="info",
-        )
+        if removed > 0:
+            self.log(
+                message=f"State cleanup: removed {removed} entries older than {state_cleanup_days} days",
+                level="info",
+            )
 
         self._last_cleanup = now
-
-    async def next_batch(self):
-        """
-        Main loop: listen to notifications and process alert updates.
-        """
-        # Initialize session and state manager
-        await self._init_session()
-        state_path = self._data_path / "alert_thresholds_state.json"
-        self.state_manager = AlertStateManager(state_path, logger=self.log)
-
-        self.log(message="AlertEventsThresholdTrigger started", level="info")
-
-        try:
-            # Subscribe to alert updated notifications
-            async for notification in self._subscribe_to_notifications("alert", "updated"):
-                try:
-                    await self._cleanup_old_states()
-                    await self._process_alert_update(notification)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    self.log_exception(e, message="Error processing notification")
-
-        finally:
-            await self._close_session()
-
-    async def run(self):
-        """Entrypoint for the trigger."""
-        try:
-            while True:
-                try:
-                    await self.next_batch()
-                except asyncio.CancelledError:
-                    self.log(message="Trigger cancelled", level="info")
-                    break
-                except Exception as e:
-                    self.log_exception(e, message="Fatal error in trigger")
-                    await asyncio.sleep(RESTART_DELAY_SECONDS)
-        finally:
-            # Ensure session is closed on exit
-            await self._close_session()
